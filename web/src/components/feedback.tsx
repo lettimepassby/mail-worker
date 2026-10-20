@@ -1,11 +1,17 @@
-import { CheckCircle2, XCircle } from 'lucide-react';
+import { CheckCircle2, Mail, XCircle } from 'lucide-react';
 import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from 'react';
 import { Button, Modal, cx } from './ui';
 
+interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 interface Toast {
   id: number;
-  kind: 'success' | 'error';
+  kind: 'success' | 'error' | 'info';
   message: string;
+  action?: ToastAction;
 }
 
 interface ConfirmOptions {
@@ -16,7 +22,7 @@ interface ConfirmOptions {
 }
 
 interface Feedback {
-  toast: (message: string, kind?: Toast['kind']) => void;
+  toast: (message: string, kind?: Toast['kind'], action?: ToastAction) => void;
   error: (err: unknown) => void;
   confirm: (opts: ConfirmOptions) => Promise<boolean>;
 }
@@ -29,11 +35,17 @@ export function FeedbackProvider({ children }: { children: ReactNode }) {
   const resolver = useRef<((ok: boolean) => void) | null>(null);
   const nextId = useRef(1);
 
-  const toast = useCallback((message: string, kind: Toast['kind'] = 'success') => {
-    const id = nextId.current++;
-    setToasts((t) => [...t, { id, kind, message }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === 'error' ? 5000 : 2500);
-  }, []);
+  const dismiss = useCallback((id: number) => setToasts((t) => t.filter((x) => x.id !== id)), []);
+
+  const toast = useCallback(
+    (message: string, kind: Toast['kind'] = 'success', action?: ToastAction) => {
+      const id = nextId.current++;
+      // Keep at most three on screen (a burst of new mail shouldn't bury the page).
+      setToasts((t) => [...t.slice(-2), { id, kind, message, action }]);
+      setTimeout(() => dismiss(id), action ? 8000 : kind === 'error' ? 5000 : 2500);
+    },
+    [dismiss],
+  );
 
   const error = useCallback((err: unknown) => toast(err instanceof Error ? err.message : String(err), 'error'), [toast]);
 
@@ -82,10 +94,23 @@ export function FeedbackProvider({ children }: { children: ReactNode }) {
           >
             {t.kind === 'success' ? (
               <CheckCircle2 className="size-4 shrink-0 text-emerald-400 dark:text-emerald-600" />
+            ) : t.kind === 'info' ? (
+              <Mail className="size-4 shrink-0 text-blue-300 dark:text-blue-600" />
             ) : (
               <XCircle className="size-4 shrink-0 text-red-400 dark:text-red-600" />
             )}
-            {t.message}
+            <span className="min-w-0 truncate">{t.message}</span>
+            {t.action && (
+              <button
+                onClick={() => {
+                  t.action!.onClick();
+                  dismiss(t.id);
+                }}
+                className="ml-1 shrink-0 rounded-md bg-white/15 px-2 py-0.5 text-[13px] font-medium hover:bg-white/25 dark:bg-zinc-900/10 dark:hover:bg-zinc-900/20"
+              >
+                {t.action.label}
+              </button>
+            )}
           </div>
         ))}
       </div>

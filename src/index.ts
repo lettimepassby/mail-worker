@@ -4,7 +4,7 @@ import { csrfGuard } from './auth';
 import { CloudflareError } from './cloudflare';
 import type { AppEnv, Env } from './env';
 import { handleEmail } from './inbound';
-import { runMaintenance } from './maintenance';
+import { cleanup, retryPending } from './maintenance';
 import admin from './routes/admin';
 import auth from './routes/auth';
 import mail, { inline } from './routes/mail';
@@ -13,6 +13,7 @@ const app = new Hono<AppEnv>().basePath('/api');
 
 app.use('*', async (c, next) => {
   await next();
+  if (c.res.status === 101) return; // WebSocket upgrade: headers are immutable
   c.header('cache-control', c.res.headers.get('cache-control') ?? 'no-store');
   c.header('x-content-type-options', 'nosniff');
 });
@@ -33,6 +34,8 @@ app.onError((err, c) => {
   return c.json({ error: '服务器内部错误' }, 500);
 });
 
+export { Realtime } from './realtime';
+
 export default {
   fetch: app.fetch,
 
@@ -40,7 +43,7 @@ export default {
     await handleEmail(message, env, ctx);
   },
 
-  async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(runMaintenance(env));
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(controller.cron === '7 * * * *' ? cleanup(env) : retryPending(env));
   },
 } satisfies ExportedHandler<Env>;

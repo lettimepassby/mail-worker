@@ -2,6 +2,7 @@ import { useInfiniteQuery, useQueryClient, type InfiniteData } from '@tanstack/r
 import { useCallback } from 'react';
 import { api, buildQuery, post, type MessageDetail, type MessagePage, type MessageSummary, type View } from '../api';
 import { useFeedback } from '../components/feedback';
+import { fallbackInterval } from './realtime';
 
 export const VIEW_LABELS: Record<View, string> = {
   inbox: '收件箱',
@@ -28,7 +29,7 @@ export function useMessageList({ view, d, a, q }: ListFilter) {
       api<MessagePage>(`/mail/messages${buildQuery({ view, domain: d, address: a, q, cursor: pageParam })}`),
     initialPageParam: null as string | null,
     getNextPageParam: (last) => last.nextCursor,
-    refetchInterval: 60_000,
+    refetchInterval: fallbackInterval,
   });
 }
 

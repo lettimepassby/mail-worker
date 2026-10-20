@@ -1,6 +1,10 @@
+import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
-import { Outlet, useLocation } from 'react-router';
+import { Outlet, useLocation, useNavigate } from 'react-router';
+import { copyText } from '../lib/clipboard';
+import { useRealtime } from '../lib/realtime';
 import { NavContext } from '../lib/session';
+import { useFeedback } from './feedback';
 import Sidebar from './Sidebar';
 import { cx } from './ui';
 
@@ -9,6 +13,30 @@ export default function AppLayout() {
   const location = useLocation();
 
   useEffect(() => setNavOpen(false), [location.pathname, location.search]);
+
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const { toast, error } = useFeedback();
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ['mailboxes'] });
+    qc.invalidateQueries({ queryKey: ['messages'] });
+  };
+  useRealtime({
+    onOpen: refresh,
+    onMail: (e) => {
+      refresh();
+      if (e.folder === 'spam') return;
+      if (e.code) {
+        const code = e.code;
+        toast(`${e.address} 收到验证码 ${code}`, 'info', {
+          label: '复制',
+          onClick: () => copyText(code).then(() => toast(`已复制 ${code}`), error),
+        });
+      } else {
+        toast(`新邮件：${e.subject || '(无主题)'}`, 'info', { label: '查看', onClick: () => navigate(`/mail/inbox/${e.id}`) });
+      }
+    },
+  });
 
   return (
     <NavContext.Provider value={{ openNav: () => setNavOpen(true) }}>

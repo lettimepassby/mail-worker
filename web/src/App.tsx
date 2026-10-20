@@ -6,7 +6,9 @@ import AppLayout from './components/AppLayout';
 import { Spinner } from './components/ui';
 import { SessionContext, useSession } from './lib/session';
 import DomainsPage from './pages/admin/Domains';
+import NotifyPage from './pages/admin/Notify';
 import RulesPage from './pages/admin/Rules';
+import UsagePage from './pages/admin/Usage';
 import UsersPage from './pages/admin/Users';
 import { LoginPage, SetupPage } from './pages/Login';
 import MailPage from './pages/Mail';
@@ -66,6 +68,22 @@ export default function App() {
             element={
               <AdminOnly>
                 <RulesPage />
+              </AdminOnly>
+            }
+          />
+          <Route
+            path="admin/notify"
+            element={
+              <AdminOnly>
+                <NotifyPage />
+              </AdminOnly>
+            }
+          />
+          <Route
+            path="admin/usage"
+            element={
+              <AdminOnly>
+                <UsagePage />
               </AdminOnly>
             }
           />

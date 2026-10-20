@@ -1,8 +1,9 @@
 import { useQueryClient } from '@tanstack/react-query';
-import { Inbox, Menu, Paperclip, RefreshCw, Search, Star, X } from 'lucide-react';
+import { Check, Copy, Inbox, Menu, Paperclip, RefreshCw, Search, Star, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useSearchParams } from 'react-router';
+import { Link, useNavigate, useSearchParams } from 'react-router';
 import { post, type MessageSummary } from '../api';
+import { copyText } from '../lib/clipboard';
 import { domainHue, senderLabel, shortTime } from '../lib/format';
 import { useMessageActions, useMessageList, VIEW_LABELS, type BatchAction, type ListFilter } from '../lib/mail';
 import { useNav } from '../lib/session';
@@ -26,6 +27,7 @@ function Row({
   selected,
   onSelect,
   onStar,
+  onOpen,
 }: {
   m: MessageSummary;
   href: string;
@@ -33,6 +35,7 @@ function Row({
   selected: boolean;
   onSelect: (checked: boolean) => void;
   onStar: () => void;
+  onOpen: () => void;
 }) {
   const unread = !m.is_read;
   return (
@@ -62,22 +65,25 @@ function Row({
           <Star className="size-4" fill={m.is_starred ? 'currentColor' : 'none'} />
         </button>
       </div>
-      <Link to={href} className="min-w-0 flex-1 py-3 pr-3 pl-3 sm:pr-4">
-        <div className="flex items-baseline gap-2">
-          <span className={cx('truncate text-sm', unread ? 'font-semibold text-zinc-900 dark:text-white' : 'text-zinc-700 dark:text-zinc-300')}>
-            {senderLabel(m.from_name, m.from_addr)}
-          </span>
-          <span className={cx('ml-auto shrink-0 text-xs tabular-nums', unread ? 'font-medium text-blue-600 dark:text-blue-400' : 'text-zinc-500')}>
-            {shortTime(m.received_at)}
-          </span>
-        </div>
-        <div className={cx('mt-0.5 truncate text-sm', unread ? 'font-medium text-zinc-900 dark:text-zinc-100' : 'text-zinc-700 dark:text-zinc-300')}>
-          {m.subject || '(无主题)'}
-        </div>
-        <div className="mt-0.5 line-clamp-1 text-[13px] text-zinc-500">
-          {m.status === 'failed' ? '⚠ 邮件解析失败，可下载原文查看' : m.status === 'pending' ? '正在处理…' : m.snippet || '\u00a0'}
-        </div>
-        <div className="mt-1.5 flex items-center gap-2">
+      <div className="min-w-0 flex-1 py-3 pr-3 pl-3 sm:pr-4">
+        <Link to={href} className="block">
+          <div className="flex items-baseline gap-2">
+            <span className={cx('truncate text-sm', unread ? 'font-semibold text-zinc-900 dark:text-white' : 'text-zinc-700 dark:text-zinc-300')}>
+              {senderLabel(m.from_name, m.from_addr)}
+            </span>
+            <span className={cx('ml-auto shrink-0 text-xs tabular-nums', unread ? 'font-medium text-blue-600 dark:text-blue-400' : 'text-zinc-500')}>
+              {shortTime(m.received_at)}
+            </span>
+          </div>
+          <div className={cx('mt-0.5 truncate text-sm', unread ? 'font-medium text-zinc-900 dark:text-zinc-100' : 'text-zinc-700 dark:text-zinc-300')}>
+            {m.subject || '(无主题)'}
+          </div>
+          <div className="mt-0.5 line-clamp-1 text-[13px] text-zinc-500">
+            {m.status === 'failed' ? '⚠ 邮件解析失败，可下载原文查看' : m.status === 'pending' ? '正在处理…' : m.snippet || '\u00a0'}
+          </div>
+        </Link>
+        {/* Outside the link so the copy button isn't nested in an anchor; clicks elsewhere still open the mail. */}
+        <div className="mt-1.5 flex cursor-pointer items-center gap-2" onClick={onOpen}>
           <AddressChip address={m.address} />
           {m.attachment_count > 0 && (
             <span className="inline-flex shrink-0 items-center gap-0.5 text-[11px] text-zinc-500">
@@ -85,15 +91,40 @@ function Row({
               {m.attachment_count}
             </span>
           )}
+          {m.verify_code && <CodeChip code={m.verify_code} />}
         </div>
-      </Link>
+      </div>
     </li>
+  );
+}
+
+/** One-tap copy of an extracted verification code. */
+export function CodeChip({ code }: { code: string }) {
+  const { toast, error } = useFeedback();
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={(e) => {
+        e.stopPropagation();
+        copyText(code).then(() => {
+          setCopied(true);
+          toast(`已复制验证码 ${code}`);
+          setTimeout(() => setCopied(false), 1500);
+        }, error);
+      }}
+      title="复制验证码"
+      className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 font-mono text-xs font-semibold text-blue-700 ring-1 ring-blue-200 ring-inset hover:bg-blue-100 dark:bg-blue-500/10 dark:text-blue-300 dark:ring-blue-500/30 dark:hover:bg-blue-500/20"
+    >
+      {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+      {code}
+    </button>
   );
 }
 
 export default function MessageList({ filter, selectedId }: { filter: ListFilter; selectedId: number | null }) {
   const { view, d, a, q } = filter;
   const [search, setSearch] = useSearchParams();
+  const navigate = useNavigate();
   const { openNav } = useNav();
   const run = useMessageActions();
   const { confirm, toast, error } = useFeedback();
@@ -284,6 +315,7 @@ export default function MessageList({ filter, selectedId }: { filter: ListFilter
                   })
                 }
                 onStar={() => run([m.id], m.is_starred ? 'unstar' : 'star', { silent: true })}
+                onOpen={() => navigate(hrefFor(m.id))}
               />
             ))}
           </ul>

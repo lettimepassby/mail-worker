@@ -1,6 +1,7 @@
 import { decodeWords } from 'postal-mime';
 import type { Env } from './env';
 import { ingestMessage, recordParseFailure } from './ingest';
+import { today } from './settings';
 import { newPrefix, rawKey } from './storage';
 import { collapseWhitespace, domainOf, normalizeAddress } from './util';
 
@@ -56,9 +57,16 @@ export async function handleEmail(message: ForwardableEmailMessage, env: Env, ct
        ON CONFLICT (address) DO UPDATE SET last_received_at = excluded.last_received_at`,
     ).bind(to, domain, now),
     env.DB.prepare(
-      `INSERT INTO messages (r2_prefix, domain, address, envelope_from, from_addr, subject, received_at, size)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-    ).bind(prefix, domain, to, from, from, subject, now, raw.byteLength),
+      `INSERT INTO messages (r2_prefix, domain, address, envelope_from, from_addr, subject, received_at, size, r2_bytes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+    ).bind(prefix, domain, to, from, from, subject, now, raw.byteLength, raw.byteLength),
+    env.DB.prepare(
+      "UPDATE counters SET value = value + CASE key WHEN 'messages' THEN 1 ELSE ? END WHERE key IN ('messages', 'r2_bytes')",
+    ).bind(raw.byteLength),
+    env.DB.prepare(
+      `INSERT INTO usage_daily (day, messages, bytes) VALUES (?, 1, ?)
+       ON CONFLICT (day) DO UPDATE SET messages = messages + 1, bytes = bytes + excluded.bytes`,
+    ).bind(today(), raw.byteLength),
   ]);
   const id = (inserted.results[0] as { id: number }).id;
 

@@ -20,10 +20,14 @@
     }
   ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "mail-worker" }],
-  // Retry failed parses, purge old trash/spam, drop expired sessions.
-  "triggers": { "crons": ["*/10 * * * *"] },
+  "durable_objects": { "bindings": [{ "name": "REALTIME", "class_name": "Realtime" }] },
+  // SQLite-backed Durable Objects are available on the Workers Free plan.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Realtime"] }],
+  // Every 10 min: retry failed parses. Hourly: retention cleanup.
+  "triggers": { "crons": ["*/10 * * * *", "7 * * * *"] },
   "vars": {
     "WORKER_NAME": "mail-worker",
+    "PUBLIC_URL": "https://mail.yorhamc.com",
     // ~3ms CPU; fits the Free plan's 10ms budget. Raise to 100000 on Workers Paid.
     "PASSWORD_HASH_ITERATIONS": "20000",
     "TRASH_RETENTION_DAYS": "30",

@@ -9,6 +9,9 @@ import {
   type RoutingRule,
 } from '../cloudflare';
 import type { AppEnv, Role } from '../env';
+import { cleanup } from '../maintenance';
+import { parseBarkInput, sendBark, type BarkTarget } from '../notify';
+import { FREE_LIMITS, getSettings, getUsage, SETTING_KEYS } from '../settings';
 import { badRequest, domainOf, forbidden, isEmail, normalizeAddress, notFound } from '../util';
 
 interface AccessEntry {
@@ -381,6 +384,176 @@ admin.post('/cloudflare/zones/:id/takeover', async (c) => {
     done.push(address);
   }
   return c.json({ ok: true, addresses: done });
+});
+
+// Bark push -----------------------------------------------------------------------
+
+const maskKey = (key: string) => (key.length <= 8 ? '••••' : `${key.slice(0, 4)}••••${key.slice(-4)}`);
+
+admin.get('/bark', async (c) => {
+  const [targets, rules] = await c.env.DB.batch<Record<string, unknown>>([
+    c.env.DB.prepare('SELECT id, name, server, device_key, enabled, last_sent_at, last_error, created_at FROM bark_targets ORDER BY id'),
+    c.env.DB.prepare('SELECT * FROM notify_rules ORDER BY id'),
+  ]);
+  return c.json({
+    targets: targets.results.map(({ device_key, ...t }) => ({ ...t, enabled: !!t.enabled, key: maskKey(String(device_key)) })),
+    rules: rules.results.map((r) => ({
+      ...r,
+      enabled: !!r.enabled,
+      require_code: !!r.require_code,
+      keywords: JSON.parse(String(r.keywords)),
+      fields: JSON.parse(String(r.fields)),
+      scopes: JSON.parse(String(r.scopes)),
+      target_ids: JSON.parse(String(r.target_ids)),
+    })),
+    publicUrl: c.env.PUBLIC_URL ?? null,
+  });
+});
+
+admin.post('/bark', async (c) => {
+  const body = await c.req.json<{ name?: string; key?: string; server?: string }>();
+  const parsed = parseBarkInput(body.key ?? '', body.server);
+  if (!parsed) badRequest('无法识别：请粘贴 Bark App 里的推送链接（如 https://api.day.app/xxxx），或填写设备 Key');
+  const name = (body.name ?? '').trim() || '我的 iPhone';
+  const res = await c.env.DB.prepare(
+    'INSERT INTO bark_targets (name, server, device_key, created_at) VALUES (?, ?, ?, ?) RETURNING id',
+  )
+    .bind(name, parsed.server, parsed.key, Date.now())
+    .first<{ id: number }>();
+  return c.json({ ok: true, id: res?.id });
+});
+
+admin.patch('/bark/:id', async (c) => {
+  const id = Number(c.req.param('id'));
+  const body = await c.req.json<{ name?: string; enabled?: boolean }>();
+  const stmts: D1PreparedStatement[] = [];
+  if (typeof body.name === 'string' && body.name.trim()) {
+    stmts.push(c.env.DB.prepare('UPDATE bark_targets SET name = ? WHERE id = ?').bind(body.name.trim(), id));
+  }
+  if (typeof body.enabled === 'boolean') {
+    stmts.push(c.env.DB.prepare('UPDATE bark_targets SET enabled = ? WHERE id = ?').bind(body.enabled ? 1 : 0, id));
+  }
+  if (stmts.length) await c.env.DB.batch(stmts);
+  return c.json({ ok: true });
+});
+
+admin.delete('/bark/:id', async (c) => {
+  await c.env.DB.prepare('DELETE FROM bark_targets WHERE id = ?').bind(Number(c.req.param('id'))).run();
+  return c.json({ ok: true });
+});
+
+admin.post('/bark/:id/test', async (c) => {
+  const id = Number(c.req.param('id'));
+  const target = await c.env.DB.prepare('SELECT * FROM bark_targets WHERE id = ?').bind(id).first<BarkTarget>();
+  if (!target) notFound('设备不存在');
+  let error: string | null = null;
+  try {
+    await sendBark(target, {
+      title: '482913 · 测试推送',
+      body: '这是一条来自邮件中心的测试通知。\n真实推送时，验证码会自动复制到剪贴板。',
+      group: '邮件中心',
+      copy: '482913',
+      autoCopy: '1',
+      url: c.env.PUBLIC_URL,
+    });
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+  }
+  await c.env.DB.prepare('UPDATE bark_targets SET last_sent_at = ?, last_error = ? WHERE id = ?').bind(Date.now(), error, id).run();
+  if (error) badRequest(`推送失败：${error}`);
+  return c.json({ ok: true });
+});
+
+const RULE_FIELDS = ['subject', 'from', 'body'];
+
+function parseRule(body: Record<string, unknown>) {
+  const strings = (v: unknown, max: number) =>
+    Array.isArray(v)
+      ? [...new Set(v.map((x) => String(x).trim()).filter(Boolean))].slice(0, max)
+      : [];
+  const name = String(body.name ?? '').trim();
+  if (!name) badRequest('请填写规则名称');
+  const fields = strings(body.fields, 3).filter((f) => RULE_FIELDS.includes(f));
+  const targets = Array.isArray(body.target_ids) ? body.target_ids.map(Number).filter(Number.isSafeInteger) : [];
+  if (targets.length === 0) badRequest('请至少选择一个 Bark 设备');
+  return {
+    name: name.slice(0, 60),
+    keywords: JSON.stringify(strings(body.keywords, 50).map((k) => k.slice(0, 100))),
+    fields: JSON.stringify(fields.length ? fields : RULE_FIELDS),
+    scopes: JSON.stringify(strings(body.scopes, 50).map((x) => x.toLowerCase())),
+    require_code: body.require_code ? 1 : 0,
+    target_ids: JSON.stringify(targets),
+    enabled: body.enabled === false ? 0 : 1,
+  };
+}
+
+admin.post('/notify-rules', async (c) => {
+  const r = parseRule(await c.req.json());
+  await c.env.DB.prepare(
+    `INSERT INTO notify_rules (name, keywords, fields, scopes, require_code, target_ids, enabled, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(r.name, r.keywords, r.fields, r.scopes, r.require_code, r.target_ids, r.enabled, Date.now())
+    .run();
+  return c.json({ ok: true });
+});
+
+admin.put('/notify-rules/:id', async (c) => {
+  const r = parseRule(await c.req.json());
+  const res = await c.env.DB.prepare(
+    `UPDATE notify_rules SET name = ?, keywords = ?, fields = ?, scopes = ?, require_code = ?, target_ids = ?, enabled = ?
+      WHERE id = ?`,
+  )
+    .bind(r.name, r.keywords, r.fields, r.scopes, r.require_code, r.target_ids, r.enabled, Number(c.req.param('id')))
+    .run();
+  if (!res.meta.changes) notFound('规则不存在');
+  return c.json({ ok: true });
+});
+
+admin.patch('/notify-rules/:id', async (c) => {
+  const { enabled } = await c.req.json<{ enabled?: boolean }>();
+  if (typeof enabled !== 'boolean') badRequest('enabled 必须是布尔值');
+  await c.env.DB.prepare('UPDATE notify_rules SET enabled = ? WHERE id = ?').bind(enabled ? 1 : 0, Number(c.req.param('id'))).run();
+  return c.json({ ok: true });
+});
+
+admin.delete('/notify-rules/:id', async (c) => {
+  await c.env.DB.prepare('DELETE FROM notify_rules WHERE id = ?').bind(Number(c.req.param('id'))).run();
+  return c.json({ ok: true });
+});
+
+// Usage & retention ----------------------------------------------------------------
+
+admin.get('/usage', async (c) => {
+  const [usage, settings, daily] = await Promise.all([
+    getUsage(c.env),
+    getSettings(c.env),
+    c.env.DB.prepare('SELECT day, messages, bytes FROM usage_daily ORDER BY day DESC LIMIT 30').all(),
+  ]);
+  return c.json({ usage, settings, limits: FREE_LIMITS, daily: daily.results });
+});
+
+admin.put('/settings', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>();
+  const stmts: D1PreparedStatement[] = [];
+  for (const key of SETTING_KEYS) {
+    if (body[key] === undefined) continue;
+    const n = Number(body[key]);
+    if (!Number.isInteger(n) || n < 0 || n > 3650) badRequest('天数需为 0-3650 的整数');
+    stmts.push(
+      c.env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value').bind(
+        key,
+        String(n),
+      ),
+    );
+  }
+  if (stmts.length) await c.env.DB.batch(stmts);
+  return c.json({ ok: true });
+});
+
+admin.post('/cleanup', async (c) => {
+  await cleanup(c.env);
+  return c.json({ ok: true, usage: await getUsage(c.env) });
 });
 
 export default admin;

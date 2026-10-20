@@ -3,13 +3,16 @@ import {
   AlertTriangle,
   Archive,
   ArrowLeft,
+  Check,
   ChevronDown,
+  Copy,
   Download,
   ExternalLink,
   FileCode2,
   FileText,
   Image as ImageIcon,
   Inbox,
+  Link2,
   MailOpen,
   Paperclip,
   ShieldAlert,
@@ -17,7 +20,8 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { api, patch, type Mailbox, type MessageDetail } from '../api';
+import { api, patch, type Mailbox, type MessageDetail, type MessageLink } from '../api';
+import { copyText } from '../lib/clipboard';
 import { avatarStyle, fileSize, fullTime, initial, senderLabel } from '../lib/format';
 import { useMessageActions, type BatchAction } from '../lib/mail';
 import EmailFrame, { hasRemoteContent } from './EmailFrame';
@@ -69,6 +73,120 @@ function AttachmentIcon({ mime }: { mime: string }) {
   if (mime.startsWith('image/')) return <ImageIcon className="size-5" />;
   if (mime === 'application/pdf' || mime.startsWith('text/')) return <FileText className="size-5" />;
   return <Paperclip className="size-5" />;
+}
+
+function useCopy() {
+  const { toast, error } = useFeedback();
+  const [copied, setCopied] = useState<string | null>(null);
+  const copy = (text: string, label: string) =>
+    copyText(text).then(() => {
+      setCopied(text);
+      toast(`已复制${label}`);
+      setTimeout(() => setCopied((c) => (c === text ? null : c)), 1500);
+    }, error);
+  return { copied, copy };
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return url;
+  }
+}
+
+function LinkRow({ link, copied, onCopy }: { link: MessageLink; copied: boolean; onCopy: () => void }) {
+  return (
+    <li className="flex items-center gap-3 py-2">
+      <Link2 className="size-4 shrink-0 text-zinc-400" />
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-medium text-zinc-900 dark:text-zinc-100">{link.text || hostOf(link.url)}</div>
+        <div className="truncate text-xs text-zinc-500" title={link.url}>
+          {link.url}
+        </div>
+      </div>
+      <Button size="sm" onClick={onCopy} aria-label="复制链接">
+        {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+        复制
+      </Button>
+      <a
+        href={link.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        title="在新标签页打开"
+        aria-label="打开链接"
+        className="flex size-8 shrink-0 items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+      >
+        <ExternalLink className="size-4" />
+      </a>
+    </li>
+  );
+}
+
+/** The code and the "click here" links, pulled out of the body with one-tap copy. */
+function QuickActions({ code, links, risky }: { code: string | null; links: MessageLink[]; risky: boolean }) {
+  const { copied, copy } = useCopy();
+  const primary = links.filter((l) => l.primary);
+  if (!code && primary.length === 0) return null;
+  return (
+    <div
+      className={cx(
+        'mt-5 rounded-xl px-4 py-3 ring-1',
+        risky ? 'bg-amber-50/60 ring-amber-200 dark:bg-amber-500/5 dark:ring-amber-500/30' : 'bg-blue-50/50 ring-blue-100 dark:bg-blue-500/5 dark:ring-blue-500/20',
+      )}
+    >
+      {risky && <p className="mb-2 text-xs text-amber-800 dark:text-amber-300">发件人未通过验证，复制或打开前请确认来源可信。</p>}
+      {code && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 py-1">
+          <span className="text-xs font-medium text-zinc-500">验证码</span>
+          <button
+            onClick={() => copy(code, `验证码 ${code}`)}
+            title="点击复制"
+            className="font-mono text-2xl font-semibold tracking-[0.18em] text-zinc-900 select-all dark:text-white"
+          >
+            {code}
+          </button>
+          <Button size="sm" variant="primary" onClick={() => copy(code, `验证码 ${code}`)} className="ml-auto">
+            {copied === code ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+            {copied === code ? '已复制' : '复制'}
+          </Button>
+        </div>
+      )}
+      {primary.length > 0 && (
+        <ul className={cx(code && 'mt-1 border-t border-blue-100 dark:border-blue-500/20')}>
+          {primary.map((l) => (
+            <LinkRow key={l.url} link={l} copied={copied === l.url} onCopy={() => copy(l.url, '链接')} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function AllLinks({ links }: { links: MessageLink[] }) {
+  const [open, setOpen] = useState(false);
+  const { copied, copy } = useCopy();
+  if (links.length === 0) return null;
+  return (
+    <div className="mt-6">
+      <button
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        className="flex items-center gap-1.5 text-sm font-medium text-zinc-700 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white"
+      >
+        <Link2 className="size-4" />
+        邮件中的全部链接（{links.length}）
+        <ChevronDown className={cx('size-3.5 transition-transform', open && 'rotate-180')} />
+      </button>
+      {open && (
+        <ul className="mt-2 divide-y divide-zinc-100 rounded-lg px-3 ring-1 ring-zinc-200 dark:divide-zinc-800 dark:ring-zinc-800">
+          {links.map((l) => (
+            <LinkRow key={l.url} link={l} copied={copied === l.url} onCopy={() => copy(l.url, '链接')} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 export default function MessageView({
@@ -224,6 +342,8 @@ export default function MessageView({
             </div>
           )}
 
+          <QuickActions code={m.verify_code} links={data.links} risky={authFailed} />
+
           <div className="mt-5 flex gap-3">
             <div className="flex size-10 shrink-0 items-center justify-center rounded-full text-sm font-semibold text-white" style={avatarStyle(m.from_addr)}>
               {initial(m.from_name, m.from_addr)}
@@ -331,6 +451,8 @@ export default function MessageView({
               </ul>
             </div>
           )}
+
+          <AllLinks links={data.links} />
         </div>
       </div>
     </div>

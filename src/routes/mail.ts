@@ -3,7 +3,9 @@ import { scopeFor } from '../access';
 import { requireUser } from '../auth';
 import type { AppEnv, Env } from '../env';
 import { sanitizeEmailHtml } from '../html';
-import { attachmentKey, bodyKey, purgeMessages, rawKey, type StoredBody } from '../storage';
+import { extractLinks } from '../extract';
+import { realtimeHub, type ClientScope } from '../realtime';
+import { attachmentKey, bodyKey, PURGE_COLUMNS, purgeMessages, rawKey, type PurgeRow, type StoredBody } from '../storage';
 import { badRequest, hmac, notFound, parseIntParam, safeEqual } from '../util';
 
 const PAGE_SIZE = 50;
@@ -39,10 +41,14 @@ interface MessageRow {
   dmarc: string | null;
   status: 'pending' | 'ready' | 'failed';
   parse_error: string | null;
+  verify_code: string | null;
+  links_json: string;
+  notified: number;
+  r2_bytes: number;
 }
 
 const LIST_COLUMNS = `m.id, m.domain, m.address, m.from_addr, m.from_name, m.subject, m.snippet,
-  m.received_at, m.sent_at, m.attachment_count, m.folder, m.is_read, m.is_starred, m.status`;
+  m.received_at, m.sent_at, m.attachment_count, m.folder, m.is_read, m.is_starred, m.status, m.verify_code`;
 
 function escapeLike(s: string) {
   return s.replace(/[\\%_]/g, (ch) => `\\${ch}`);
@@ -255,11 +261,13 @@ mail.get('/messages/:id', async (c) => {
 
   let html: string | null = null;
   let text: string | null = null;
+  let links: ReturnType<typeof extractLinks> = [];
   if (row.status === 'ready') {
     const obj = await c.env.BUCKET.get(bodyKey(row.r2_prefix));
     if (obj) {
       const body = await obj.json<StoredBody>();
       text = body.text;
+      links = extractLinks(body.html, body.text);
       if (body.html) {
         const cids = new Map<string, string>();
         for (const a of attachments) {
@@ -270,7 +278,7 @@ mail.get('/messages/:id', async (c) => {
     }
   }
 
-  const { r2_prefix: _prefix, to_json, cc_json, is_read, is_starred, ...rest } = row;
+  const { r2_prefix: _prefix, to_json, cc_json, links_json: _links, notified: _n, r2_bytes: _b, is_read, is_starred, ...rest } = row;
   return c.json({
     message: {
       ...rest,
@@ -280,6 +288,7 @@ mail.get('/messages/:id', async (c) => {
       is_starred: !!is_starred,
     },
     attachments: attachments.map((a) => ({ ...a, inline: !!a.inline, previewable: isPreviewable(a.mime) })),
+    links,
     html,
     text,
   });
@@ -340,11 +349,11 @@ mail.post('/messages/batch', async (c) => {
   if (body.action === 'delete') {
     // Permanent delete is limited to trash and spam.
     const { results } = await c.env.DB.prepare(
-      `SELECT m.id, m.r2_prefix, m.attachment_count FROM messages m
+      `SELECT ${PURGE_COLUMNS} FROM messages m
         WHERE m.id IN (SELECT value FROM json_each(?)) AND m.folder IN ('trash', 'spam') AND ${scope.sql}`,
     )
       .bind(idList, ...scope.params)
-      .all<{ id: number; r2_prefix: string; attachment_count: number }>();
+      .all<PurgeRow>();
     await purgeMessages(c.env, results);
     return c.json({ ok: true, affected: results.length });
   }
@@ -376,10 +385,10 @@ mail.post('/messages/empty', async (c) => {
     params.push(body.address.toLowerCase());
   }
   const { results } = await c.env.DB.prepare(
-    `SELECT m.id, m.r2_prefix, m.attachment_count FROM messages m WHERE ${where.join(' AND ')} LIMIT 200`,
+    `SELECT ${PURGE_COLUMNS} FROM messages m WHERE ${where.join(' AND ')} LIMIT 200`,
   )
     .bind(...params)
-    .all<{ id: number; r2_prefix: string; attachment_count: number }>();
+    .all<PurgeRow>();
   await purgeMessages(c.env, results);
   return c.json({ ok: true, deleted: results.length, more: results.length === 200 });
 });
@@ -417,6 +426,27 @@ mail.get('/messages/:id/attachments/:idx', async (c) => {
       'content-disposition': contentDisposition(inline ? 'inline' : 'attachment', att.filename || `attachment-${idx}`),
     },
   });
+});
+
+/** WebSocket for live new-mail events, scoped to what this user may read. */
+mail.get('/realtime', async (c) => {
+  if (c.req.header('upgrade')?.toLowerCase() !== 'websocket') badRequest('Expected WebSocket');
+  // Cookies make this a credentialed request; refuse cross-site handshakes.
+  const origin = c.req.header('origin');
+  if (origin && origin !== new URL(c.req.url).origin) return c.json({ error: 'Bad origin' }, 403);
+
+  const user = c.get('user');
+  const scope: ClientScope = { admin: user.role === 'admin', domains: [], addresses: [] };
+  if (!scope.admin) {
+    const { results } = await c.env.DB.prepare('SELECT kind, value FROM user_access WHERE user_id = ?')
+      .bind(user.id)
+      .all<{ kind: string; value: string }>();
+    scope.domains = results.filter((r) => r.kind === 'domain').map((r) => r.value);
+    scope.addresses = results.filter((r) => r.kind === 'address').map((r) => r.value);
+  }
+  const req = new Request(c.req.raw);
+  req.headers.set('x-client-scope', JSON.stringify(scope));
+  return realtimeHub(c.env).fetch(req);
 });
 
 /**

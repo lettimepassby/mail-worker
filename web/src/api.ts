@@ -48,6 +48,7 @@ export interface MessageSummary {
   is_read: boolean;
   is_starred: boolean;
   status: 'pending' | 'ready' | 'failed';
+  verify_code: string | null;
 }
 
 export interface MessagePage {
@@ -82,8 +83,56 @@ export interface MessageDetail {
     inline: boolean;
     previewable: boolean;
   }[];
+  links: MessageLink[];
   html: string | null;
   text: string | null;
+}
+
+export interface MessageLink {
+  url: string;
+  text: string;
+  primary: boolean;
+}
+
+export interface MailEvent {
+  type: 'mail';
+  id: number;
+  domain: string;
+  address: string;
+  folder: string;
+  subject: string;
+  from: string;
+  code: string | null;
+}
+
+export interface BarkTarget {
+  id: number;
+  name: string;
+  server: string;
+  key: string;
+  enabled: boolean;
+  last_sent_at: number | null;
+  last_error: string | null;
+}
+
+export type RuleField = 'subject' | 'from' | 'body';
+
+export interface NotifyRule {
+  id: number;
+  name: string;
+  keywords: string[];
+  fields: RuleField[];
+  scopes: string[];
+  require_code: boolean;
+  target_ids: number[];
+  enabled: boolean;
+}
+
+export interface UsageReport {
+  usage: { d1Bytes: number; r2Bytes: number; messages: number };
+  settings: { trash_retention_days: number; spam_retention_days: number; mail_retention_days: number };
+  limits: { d1Bytes: number; r2Bytes: number; workerRequestsPerDay: number; d1RowsWrittenPerDay: number; d1RowsReadPerDay: number };
+  daily: { day: string; messages: number; bytes: number }[];
 }
 
 export interface AccessEntry {
@@ -188,6 +237,7 @@ export async function api<T>(path: string, init: { method?: string; body?: unkno
 
 export const post = <T = { ok: true }>(path: string, body: unknown = {}) => api<T>(path, { method: 'POST', body });
 export const patch = <T = { ok: true }>(path: string, body: unknown) => api<T>(path, { method: 'PATCH', body });
+export const put = <T = { ok: true }>(path: string, body: unknown) => api<T>(path, { method: 'PUT', body });
 export const del = <T = { ok: true }>(path: string) => api<T>(path, { method: 'DELETE' });
 
 export function buildQuery(params: Record<string, string | undefined | null>): string {

@@ -15,6 +15,10 @@
 - 收信策略：每个域名可选择接收所有地址，或只接收列表中的地址；可屏蔽单个地址、拦截发件人，这些都在 SMTP 阶段直接拒收
 - 转发：邮件存档后，再由 Worker 转发一份到已验证的邮箱
 - 一键接入：配置 API Token 后，可在后台对账号下的域名启用 Email Routing 并把 catch-all 指向本 Worker；原有的转发规则可以接管，转发不会中断
+- 验证码和链接提取：解析时识别验证码和「点击验证 / 重置密码 / 登录」这类主要链接。列表行可一键复制验证码，阅读页有快捷复制卡片，并能展开查看邮件中的全部链接
+- 实时刷新：新邮件经 Durable Object 以 WebSocket 推送到所有打开的页面，弹出提示（带验证码的可直接复制）；断线后自动重连，断线期间改为每分钟轮询
+- Bark 推送：可添加多台设备，按关键词、查找字段（主题、发件人、正文）、范围（域名、地址）、是否带验证码设置规则；推送时自动复制验证码，点通知打开对应邮件
+- 用量与清理：显示 D1、R2 相对免费额度的用量和每日收信量，可设置回收站、垃圾邮件、旧邮件的自动清理
 
 ## 架构
 
@@ -26,7 +30,9 @@
           D1: messages / attachments / messages_fts / users / ...
                                           ▲
 浏览器 ──► mail.example.com ──► Worker fetch()：/api/* 由 Hono 处理，其余是静态 SPA
-Cron 每 10 分钟：重试解析失败的邮件、清理回收站、清理过期会话
+          ◄── WebSocket ── Durable Object「Realtime」（休眠 API，新邮件解析完成后广播）
+解析完成 ──► Bark 规则匹配 ──► 推送到多台设备
+Cron：每 10 分钟重试解析失败的邮件；每小时按保留天数清理
 ```
 
 ## 首次部署
@@ -95,7 +101,20 @@ curl -X POST 'http://localhost:8799/cdn-cgi/handler/email?from=a@x.com&to=hello@
 | `SETUP_TOKEN` | secret | 创建首个管理员用的一次性初始化码 |
 | `CF_API_TOKEN` | secret，可选 | 后台一键接入域名时使用 |
 | `WORKER_NAME` | var | catch-all 指向的 Worker 名，需与 `name` 一致 |
-| `TRASH_RETENTION_DAYS` / `SPAM_RETENTION_DAYS` | var | 回收站 / 垃圾邮件保留天数，设为 0 表示不自动清理 |
+| `PUBLIC_URL` | var | 网页地址，Bark 通知点开后跳转用 |
+| `PASSWORD_HASH_ITERATIONS` | var | PBKDF2 迭代次数。免费版设为 20000（约 3ms CPU），付费版可改为 100000 |
+| `TRASH_RETENTION_DAYS` / `SPAM_RETENTION_DAYS` | var | 默认保留天数，可在后台「用量与清理」中覆盖 |
+
+## 免费额度
+
+本项目按 Workers 免费版设计，主要措施：
+
+- 静态资源不经过 Worker；实时刷新用 WebSocket 休眠连接，不靠轮询
+- 收信时先存原文再解析，解析放在 `waitUntil` 里，超出 10ms CPU 也不会退信；定时任务每次最多重试 3 封
+- 每次调用的 D1 语句数控制在 50 条以内（批量删除用 `json_each` 集合操作）
+- 全文索引只收录正文前 4000 字（D1 免费版单库 500 MB）
+- 用量计数器单独维护，统计页面不扫描邮件表
+- 存储超过额度的 90% 时，自动清空回收站和垃圾邮件
 
 ## 限制
 

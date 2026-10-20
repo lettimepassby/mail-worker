@@ -1,7 +1,9 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Archive,
+  BellRing,
   ChevronRight,
+  Gauge,
   Globe,
   Inbox,
   LogOut,
@@ -15,10 +17,11 @@ import {
   Users,
   type LucideIcon,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router';
-import { api, buildQuery, post, type AuthState, type MailboxDomain, type Mailboxes, type View } from '../api';
+import { api, buildQuery, post, type AuthState, type MailboxDomain, type Mailboxes, type UsageReport, type View } from '../api';
 import { domainHue } from '../lib/format';
+import { fallbackInterval, useRealtimeStatus } from '../lib/realtime';
 import { useSession } from '../lib/session';
 import { cx, Input } from './ui';
 
@@ -37,7 +40,7 @@ export function useMailboxes() {
   return useQuery({
     queryKey: ['mailboxes'],
     queryFn: () => api<Mailboxes>('/mail/mailboxes'),
-    refetchInterval: 60_000,
+    refetchInterval: fallbackInterval,
   });
 }
 
@@ -167,6 +170,36 @@ function DomainNode({
   );
 }
 
+function LiveBadge() {
+  const status = useRealtimeStatus();
+  const label = status === 'open' ? '实时' : status === 'connecting' ? '连接中' : '离线';
+  const title =
+    status === 'open' ? '实时连接正常，新邮件会立即出现' : status === 'connecting' ? '正在连接实时通道…' : '实时通道已断开，每分钟自动刷新一次';
+  return (
+    <span title={title} className="ml-auto inline-flex items-center gap-1.5 text-xs text-zinc-500">
+      <span
+        className={cx(
+          'size-1.5 rounded-full',
+          status === 'open' ? 'bg-emerald-500' : status === 'connecting' ? 'animate-pulse bg-amber-500' : 'bg-zinc-400',
+        )}
+      />
+      {label}
+    </span>
+  );
+}
+
+/** Admins see a dot on 用量与清理 once storage passes 80% of the free plan. */
+function useUsageAlert(enabled: boolean) {
+  const { data } = useQuery({
+    queryKey: ['admin', 'usage'],
+    queryFn: () => api<UsageReport>('/admin/usage'),
+    enabled,
+    staleTime: 10 * 60_000,
+  });
+  if (!data) return false;
+  return data.usage.d1Bytes / data.limits.d1Bytes > 0.8 || data.usage.r2Bytes / data.limits.r2Bytes > 0.8;
+}
+
 export default function Sidebar() {
   const user = useSession();
   const { data } = useMailboxes();
@@ -175,6 +208,12 @@ export default function Sidebar() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [filter, setFilter] = useState('');
+  const usageAlert = useUsageAlert(user.role === 'admin');
+
+  const inboxUnread = data?.folders.inbox ?? 0;
+  useEffect(() => {
+    document.title = inboxUnread ? `(${inboxUnread}) 邮件中心` : '邮件中心';
+  }, [inboxUnread]);
 
   // Rendered by the layout route, so the child's :view param isn't visible via useParams.
   const onMail = location.pathname.startsWith('/mail/');
@@ -199,6 +238,7 @@ export default function Sidebar() {
           <Mail className="size-4" strokeWidth={2.2} />
         </div>
         <span className="font-semibold tracking-tight">邮件中心</span>
+        <LiveBadge />
       </div>
 
       <nav className="pane-scroll flex-1 overflow-y-auto px-3 pb-4">
@@ -237,6 +277,10 @@ export default function Sidebar() {
               <NavItem to="/admin/domains" active={location.pathname === '/admin/domains'} icon={Globe} label="域名与接入" />
               <NavItem to="/admin/users" active={location.pathname === '/admin/users'} icon={Users} label="用户与权限" />
               <NavItem to="/admin/rules" active={location.pathname === '/admin/rules'} icon={ShieldBan} label="转发与拦截" />
+              <NavItem to="/admin/notify" active={location.pathname === '/admin/notify'} icon={BellRing} label="Bark 推送" />
+              <NavItem to="/admin/usage" active={location.pathname === '/admin/usage'} icon={Gauge} label="用量与清理">
+                {usageAlert && <span className="ml-auto size-2 rounded-full bg-amber-500" title="存储接近免费额度" />}
+              </NavItem>
             </div>
           </>
         )}

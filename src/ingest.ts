@@ -1,10 +1,14 @@
 import PostalMime, { type Address, type Email, type Header } from 'postal-mime';
 import type { Env } from './env';
+import { extractCode, extractLinks } from './extract';
+import { notifyNewMail, type NotifyMessage } from './notify';
+import { publishMail } from './realtime';
 import { attachmentKey, bodyKey, rawKey, type StoredBody } from './storage';
 import { collapseWhitespace, htmlToText } from './util';
 
 const SNIPPET_LENGTH = 200;
-const INDEX_BODY_LENGTH = 20_000;
+// Kept small: the trigram index is several times the text size and D1 Free caps a database at 500 MB.
+const INDEX_BODY_LENGTH = 4_000;
 export const MAX_PARSE_ATTEMPTS = 5;
 
 interface Mailbox {
@@ -65,6 +69,11 @@ export async function ingestMessage(env: Env, id: number, prefix: string, raw?: 
 
   const text = email.text ?? (email.html ? htmlToText(email.html) : '');
   const snippet = collapseWhitespace(text).slice(0, SNIPPET_LENGTH);
+  const subject = collapseWhitespace(email.subject ?? '');
+  const code = extractCode(subject, text);
+  const links = extractLinks(email.html ?? null, email.text ?? null)
+    .filter((l) => l.primary)
+    .map((l) => ({ url: l.url.slice(0, 2000), text: l.text.slice(0, 80) }));
 
   const attachments = email.attachments.map((a, idx) => {
     const content = typeof a.content === 'string' ? new TextEncoder().encode(a.content) : new Uint8Array(a.content);
@@ -79,59 +88,126 @@ export async function ingestMessage(env: Env, id: number, prefix: string, raw?: 
   });
 
   const body: StoredBody = { html: email.html ?? null, text: email.text ?? null };
+  const bodyBytes = new TextEncoder().encode(JSON.stringify(body));
   await Promise.all([
-    env.BUCKET.put(bodyKey(prefix), JSON.stringify(body), { httpMetadata: { contentType: 'application/json' } }),
+    env.BUCKET.put(bodyKey(prefix), bodyBytes, { httpMetadata: { contentType: 'application/json' } }),
     ...attachments.map((a) =>
       env.BUCKET.put(attachmentKey(prefix, a.idx), a.content, { httpMetadata: { contentType: a.mime } }),
     ),
   ]);
+  const extraBytes = bodyBytes.byteLength + attachments.reduce((sum, a) => sum + a.content.byteLength, 0);
 
-  const subject = collapseWhitespace(email.subject ?? '');
   const sender = from ? `${from.name} ${from.address}` : '';
   const recipients = [...to, ...cc].map((m) => `${m.name} ${m.address}`).join(' ');
+  const db = env.DB;
+  const now = Date.now();
 
-  await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE messages SET
-         from_addr = ?, from_name = ?, to_json = ?, cc_json = ?, reply_to = ?,
-         subject = ?, snippet = ?, message_id_hdr = ?, sent_at = ?, attachment_count = ?,
-         spf = ?, dkim = ?, dmarc = ?,
-         -- First successful parse only: DMARC failures go to spam.
-         folder = CASE WHEN status = 'pending' AND ? = 'fail' AND folder = 'inbox' THEN 'spam' ELSE folder END,
-         status = 'ready', parse_error = NULL
-       WHERE id = ?`,
-    ).bind(
-      from?.address ?? '',
-      from?.name ?? '',
-      JSON.stringify(to),
-      JSON.stringify(cc),
-      replyTo,
-      subject,
-      snippet,
-      email.messageId ?? null,
-      parseDate(email.date),
-      attachments.length,
-      auth.spf,
-      auth.dkim,
-      auth.dmarc,
-      auth.dmarc,
-      id,
-    ),
-    env.DB.prepare('DELETE FROM attachments WHERE message_id = ?').bind(id),
-    ...attachments.map((a) =>
-      env.DB.prepare(
-        'INSERT INTO attachments (message_id, idx, filename, mime, size, content_id, inline) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      ).bind(id, a.idx, a.filename, a.mime, a.content.byteLength, a.contentId, a.inline ? 1 : 0),
-    ),
-    env.DB.prepare('DELETE FROM messages_fts WHERE rowid = ?').bind(id),
-    env.DB.prepare('INSERT INTO messages_fts (rowid, subject, sender, recipients, body) VALUES (?, ?, ?, ?, ?)').bind(
-      id,
-      subject,
-      sender,
-      recipients,
-      text.slice(0, INDEX_BODY_LENGTH),
-    ),
+  // Few, set-based statements: the Free plan allows 50 D1 queries per invocation.
+  await db.batch([
+    // Counter first, as a delta against the previous value, so a re-parse doesn't double count.
+    db
+      .prepare("UPDATE counters SET value = value + ? - (SELECT r2_bytes - size FROM messages WHERE id = ?) WHERE key = 'r2_bytes'")
+      .bind(extraBytes, id),
+    db
+      .prepare(
+        `UPDATE messages SET
+           from_addr = ?, from_name = ?, to_json = ?, cc_json = ?, reply_to = ?,
+           subject = ?, snippet = ?, message_id_hdr = ?, sent_at = ?, attachment_count = ?,
+           spf = ?, dkim = ?, dmarc = ?, verify_code = ?, links_json = ?, r2_bytes = size + ?,
+           -- First successful parse only: DMARC failures go to spam.
+           folder_changed_at = CASE WHEN status = 'pending' AND ? = 'fail' AND folder = 'inbox' THEN ? ELSE folder_changed_at END,
+           folder = CASE WHEN status = 'pending' AND ? = 'fail' AND folder = 'inbox' THEN 'spam' ELSE folder END,
+           status = 'ready', parse_error = NULL
+         WHERE id = ?`,
+      )
+      .bind(
+        from?.address ?? '',
+        from?.name ?? '',
+        JSON.stringify(to),
+        JSON.stringify(cc),
+        replyTo,
+        subject,
+        snippet,
+        email.messageId ?? null,
+        parseDate(email.date),
+        attachments.length,
+        auth.spf,
+        auth.dkim,
+        auth.dmarc,
+        code,
+        JSON.stringify(links),
+        extraBytes,
+        auth.dmarc,
+        now,
+        auth.dmarc,
+        id,
+      ),
+    db.prepare('DELETE FROM attachments WHERE message_id = ?').bind(id),
+    db
+      .prepare(
+        `INSERT INTO attachments (message_id, idx, filename, mime, size, content_id, inline)
+         SELECT ?1, j.value ->> '$.idx', j.value ->> '$.filename', j.value ->> '$.mime',
+                j.value ->> '$.size', j.value ->> '$.cid', j.value ->> '$.inline'
+           FROM json_each(?2) j`,
+      )
+      .bind(
+        id,
+        JSON.stringify(
+          attachments.map((a) => ({
+            idx: a.idx,
+            filename: a.filename,
+            mime: a.mime,
+            size: a.content.byteLength,
+            cid: a.contentId,
+            inline: a.inline ? 1 : 0,
+          })),
+        ),
+      ),
+    db.prepare('DELETE FROM messages_fts WHERE rowid = ?').bind(id),
+    db
+      .prepare('INSERT INTO messages_fts (rowid, subject, sender, recipients, body) VALUES (?, ?, ?, ?, ?)')
+      .bind(id, subject, sender, recipients, text.slice(0, INDEX_BODY_LENGTH)),
   ]);
+
+  await afterIngest(env, id, {
+    subject,
+    fromName: from?.name ?? '',
+    fromAddr: from?.address ?? '',
+    snippet,
+    body: text.slice(0, INDEX_BODY_LENGTH),
+    code,
+    links,
+  });
+}
+
+/**
+ * Runs once per message (guarded by the `notified` flag, so parse retries
+ * never notify twice): pushes the event to open browser tabs and evaluates
+ * Bark rules. Spam is shown live but never pushed to phones.
+ */
+async function afterIngest(env: Env, id: number, msg: Omit<NotifyMessage, 'id' | 'domain' | 'address'>) {
+  const row = await env.DB.prepare(
+    'UPDATE messages SET notified = 1 WHERE id = ? AND notified = 0 RETURNING domain, address, folder',
+  )
+    .bind(id)
+    .first<{ domain: string; address: string; folder: string }>();
+  if (!row) return;
+  await publishMail(env, {
+    type: 'mail',
+    id,
+    domain: row.domain,
+    address: row.address,
+    folder: row.folder,
+    subject: msg.subject,
+    from: msg.fromName || msg.fromAddr,
+    code: msg.code,
+  });
+  if (row.folder === 'spam') return;
+  try {
+    await notifyNewMail(env, { ...msg, id, domain: row.domain, address: row.address });
+  } catch (err) {
+    console.error(`notify failed for message ${id}`, err);
+  }
 }
 
 /** Records a failed inline parse; the scheduled job retries until MAX_PARSE_ATTEMPTS. */
