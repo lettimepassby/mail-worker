@@ -1,0 +1,38 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-zinc-50 text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:not(:disabled),
+[role='button']:not(:disabled) {
+  cursor: pointer;
+}
+
+/* Thin scrollbars inside panes */
+.pane-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-zinc-300) transparent;
+  overscroll-behavior: contain;
+}
+
+@media (prefers-color-scheme: dark) {
+  .pane-scroll {
+    scrollbar-color: var(--color-zinc-700) transparent;
+  }
+}

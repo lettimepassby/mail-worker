@@ -1,0 +1,3 @@
+SESSION_SECRET=dev-secret-change-me
+SETUP_TOKEN=dev-setup
+# CF_API_TOKEN=
